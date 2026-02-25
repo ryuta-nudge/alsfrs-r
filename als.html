@@ -1,0 +1,402 @@
+import React, { useState, useMemo, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInWithCustomToken, 
+  signInAnonymously, 
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  setDoc, 
+  onSnapshot, 
+  serverTimestamp 
+} from 'firebase/firestore';
+import { 
+  ClipboardCheck, 
+  ChevronLeft, 
+  ChevronRight, 
+  Save, 
+  History, 
+  Copy, 
+  Check, 
+  Smartphone,
+  Download
+} from 'lucide-react';
+
+/* ===================================================================
+【開発者向けメモ：外部でホスティング（公開）する場合の設定】
+外部のサーバー（Vercel, Netlify, Firebase Hostingなど）で公開する場合は、
+以下の `__firebase_config` の部分をご自身のFirebaseプロジェクトの設定に書き換えてください。
+===================================================================
+*/
+const firebaseConfig = typeof __firebase_config !== 'undefined' 
+  ? JSON.parse(__firebase_config) 
+  : {
+  apiKey: "AIzaSyCJwirTjJAM1ScsPNaqxnWinICpl7Otm3I",
+  authDomain: "alsfrs-r.firebaseapp.com",
+  projectId: "alsfrs-r",
+  storageBucket: "alsfrs-r.firebasestorage.app",
+  messagingSenderId: "861611994376",
+  appId: "1:861611994376:web:16ee8126dfd4462576d0bd",
+  measurementId: "G-NT53YS5QVL"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'alsfrs-r-visit';
+
+const DOMAINS = [
+  '球麻痺機能 (Bulbar)',
+  '日常生活 (Fine Motor)',
+  '運動機能 (Gross Motor)',
+  '呼吸機能 (Respiratory)'
+];
+
+const QUESTIONS = [
+  { id: 1, domain: '球麻痺機能 (Bulbar)', title: '1. 言語 (Speech)', options: [{s:4,l:'正常'},{s:3,l:'発音の変化'},{s:2,l:'聞き返せばわかる'},{s:1,l:'非言語併用'},{s:0,l:'発声不能'}] },
+  { id: 2, domain: '球麻痺機能 (Bulbar)', title: '2. 唾液 (Salivation)', options: [{s:4,l:'正常'},{s:3,l:'わずかに増加'},{s:2,l:'時々ティッシュ必要'},{s:1,l:'常にティッシュ必要'},{s:0,l:'著しい流涎'}] },
+  { id: 3, domain: '球麻痺機能 (Bulbar)', title: '3. 嚥下 (Swallowing)', options: [{s:4,l:'正常'},{s:3,l:'早期の嚥下困難'},{s:2,l:'食事内容の変更'},{s:1,l:'経管栄養併用'},{s:0,l:'経管栄養のみ'}] },
+  { id: 4, domain: '日常生活 (Fine Motor)', title: '4. 書字 (Handwriting)', options: [{s:4,l:'正常'},{s:3,l:'少し遅い・乱れる'},{s:2,l:'一部判読不能'},{s:1,l:'ペンは持てるが書けない'},{s:0,l:'持てない'}] },
+  { id: 5, domain: '日常生活 (Fine Motor)', title: '5. 食事摂取', isDynamic: true },
+  { id: 6, domain: '日常生活 (Fine Motor)', title: '6. 着替え・身の回り', options: [{s:4,l:'正常'},{s:3,l:'自立（努力要）'},{s:2,l:'時々介助'},{s:1,l:'常に介助'},{s:0,l:'全介助'}] },
+  { id: 7, domain: '運動機能 (Gross Motor)', title: '7. 寝返り・ベッド上動作', options: [{s:4,l:'正常'},{s:3,l:'やや困難'},{s:2,l:'非常に困難'},{s:1,l:'開始可能だが介助必要'},{s:0,l:'全介助'}] },
+  { id: 8, domain: '運動機能 (Gross Motor)', title: '8. 歩行 (Walking)', options: [{s:4,l:'正常'},{s:3,l:'可能だが早期疲労'},{s:2,l:'介助・補助具必要'},{s:1,l:'非実用的'},{s:0,l:'歩行不能'}] },
+  { id: 9, domain: '運動機能 (Gross Motor)', title: '9. 階段昇降 (Climbing)', options: [{s:4,l:'正常'},{s:3,l:'遅い・早期疲労'},{s:2,l:'手すり等必要'},{s:1,l:'介助必要'},{s:0,l:'不可能'}] },
+  { id: 10, domain: '呼吸機能 (Respiratory)', title: '10. 呼吸困難 (Dyspnea)', options: [{s:4,l:'なし'},{s:3,l:'動作時'},{s:2,l:'日常動作時'},{s:1,l:'安静時'},{s:0,l:'著しい'}] },
+  { id: 11, domain: '呼吸機能 (Respiratory)', title: '11. 起座呼吸 (Orthopnea)', options: [{s:4,l:'なし'},{s:3,l:'少し苦しい'},{s:2,l:'頭を上げないと眠れない'},{s:1,l:'座位でないと眠れない'},{s:0,l:'眠れない'}] },
+  { id: 12, domain: '呼吸機能 (Respiratory)', title: '12. 呼吸不全', options: [{s:4,l:'なし'},{s:3,l:'間欠的に使用'},{s:2,l:'日中も長時間'},{s:1,l:'24時間'},{s:0,l:'気管切開'}] },
+];
+
+const PEG_OPTIONS = {
+  no: [{s:4,l:'正常'},{s:3,l:'不器用だが介助不要'},{s:2,l:'介助が必要'},{s:1,l:'全介助'},{s:0,l:'経管栄養のみ'}],
+  yes: [{s:4,l:'正常（自己管理）'},{s:3,l:'不器用だが介助不要'},{s:2,l:'準備等に介助必要'},{s:1,l:'一部手伝える'},{s:0,l:'全介助'}]
+};
+
+const App = () => {
+  const [user, setUser] = useState(null);
+  const [currentIdx, setCurrentIdx] = useState(-1);
+  const [answers, setAnswers] = useState({});
+  const [usePeg, setUsePeg] = useState(false);
+  const [patientId, setPatientId] = useState('');
+  const [view, setView] = useState('input');
+  const [copyStatus, setCopyStatus] = useState(null);
+  const [history, setHistory] = useState([]);
+
+  // Auth Initialization
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (e) {
+        console.error("Auth error", e);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // Data Fetching
+  useEffect(() => {
+    if (!user) return;
+    const q = collection(db, 'artifacts', appId, 'public', 'data', 'evaluations');
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const data = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        timestamp: doc.data().timestamp?.toDate() || new Date()
+      }));
+      setHistory(data.sort((a, b) => b.timestamp - a.timestamp));
+    }, (error) => console.error("Firestore Error:", error));
+    return () => unsubscribe();
+  }, [user]);
+
+  const totalScore = Object.values(answers).reduce((acc, curr) => acc + curr, 0);
+
+  const handleSelect = (qId, score) => {
+    setAnswers(prev => ({ ...prev, [qId]: score }));
+    if (currentIdx < QUESTIONS.length - 1) {
+      setTimeout(() => setCurrentIdx(prev => prev + 1), 200);
+    }
+  };
+
+  const copyToClipboard = (record = null) => {
+    const data = record || { timestamp: new Date(), patientId, totalScore, answers, usePeg };
+    
+    let text = `【ALSFRS-R 評価結果】\n`;
+    text += `日時: ${data.timestamp.toLocaleString()}\n`;
+    text += `ID/氏名: ${data.patientId}\n`;
+    text += `胃瘻(PEG): ${data.usePeg ? 'あり' : 'なし'}\n`;
+    text += `合計スコア: ${data.totalScore} / 48\n\n`;
+
+    DOMAINS.forEach(d => {
+      const qs = QUESTIONS.filter(q => q.domain === d);
+      const subTotal = qs.reduce((acc, q) => acc + (data.answers[q.id] || 0), 0);
+      text += `■ ${d} (${subTotal}/12)\n`;
+      
+      qs.forEach(q => {
+        const score = data.answers[q.id];
+        let label = '';
+        if (score !== undefined) {
+          const options = q.isDynamic ? (data.usePeg ? PEG_OPTIONS.yes : PEG_OPTIONS.no) : q.options;
+          const selectedOption = options.find(opt => opt.s === score);
+          label = selectedOption ? ` (${selectedOption.l})` : '';
+        }
+        let title = q.title;
+        if (q.id === 5) title = data.usePeg ? '5b. 胃瘻管理' : '5a. 食事摂取';
+        
+        text += `  ・${title}: ${score !== undefined ? score + '点' : '-'}${label}\n`;
+      });
+      text += `\n`;
+    });
+    
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      setCopyStatus(record ? record.id : 'current');
+      setTimeout(() => setCopyStatus(null), 2000);
+    } catch (err) { console.error('Copy failed', err); }
+    document.body.removeChild(textArea);
+  };
+
+  const saveToCloud = async () => {
+    if (!user || !patientId) return;
+    try {
+      const docRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'evaluations'));
+      await setDoc(docRef, { patientId, totalScore, answers, usePeg, timestamp: serverTimestamp(), createdBy: user.uid });
+      setAnswers({});
+      setPatientId('');
+      setCurrentIdx(-1);
+      setView('history');
+    } catch (e) { alert('保存失敗'); }
+  };
+
+  const exportCSV = () => {
+    const headers = ['日時', '管理ID', '合計スコア', '胃瘻', ...QUESTIONS.map(q => q.title)];
+    const rows = history.map(h => [
+      `"${h.timestamp.toLocaleString()}"`,
+      `"${h.patientId}"`,
+      h.totalScore,
+      h.usePeg ? 'あり' : 'なし',
+      ...QUESTIONS.map(q => h.answers[q.id] ?? '-')
+    ]);
+    
+    const content = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const blob = new Blob(["\uFEFF" + content], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `ALSFRS-R_history_${new Date().toLocaleDateString()}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  return (
+    <div className="min-h-screen bg-white text-slate-900 font-sans flex flex-col">
+      <header className="bg-indigo-600 text-white p-4 flex justify-between items-center shrink-0 shadow-md">
+        <div className="flex items-center gap-2">
+          <Smartphone className="w-5 h-5" />
+          <h1 className="font-bold">ALSFRS-R 訪問入力</h1>
+        </div>
+        <div className="flex gap-4">
+          <button onClick={() => setView('input')} className={`text-sm ${view === 'input' ? 'font-black underline underline-offset-4' : 'opacity-70'}`}>入力</button>
+          <button onClick={() => setView('history')} className={`text-sm ${view === 'history' ? 'font-black underline underline-offset-4' : 'opacity-70'}`}>履歴</button>
+        </div>
+      </header>
+
+      {view === 'input' ? (
+        <>
+          {currentIdx >= 0 && (
+            <div className="w-full h-1 bg-slate-100 shrink-0">
+              <div 
+                className="h-full bg-emerald-400 transition-all duration-300" 
+                style={{ width: `${((currentIdx + 1) / QUESTIONS.length) * 100}%` }}
+              />
+            </div>
+          )}
+
+          <main className="flex-1 overflow-y-auto p-6 flex flex-col">
+            {currentIdx === -1 ? (
+              <div className="flex-1 flex flex-col justify-center space-y-8 max-w-sm mx-auto w-full">
+                <div className="text-center">
+                  <div className="bg-indigo-50 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <ClipboardCheck className="w-10 h-10 text-indigo-600" />
+                  </div>
+                  <h2 className="text-2xl font-black text-slate-800">訪問評価の開始</h2>
+                  <p className="text-slate-500 text-sm mt-2">患者IDまたは氏名を入力してください</p>
+                </div>
+                
+                <div className="space-y-4">
+                  <div>
+                    <input 
+                      type="text" 
+                      value={patientId} 
+                      onChange={(e) => setPatientId(e.target.value)}
+                      placeholder="例: 山田 花子" 
+                      className="w-full text-center text-xl p-4 border-2 border-slate-200 rounded-2xl focus:border-indigo-500 outline-none transition-all"
+                    />
+                  </div>
+                  
+                  <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                    <p className="text-xs font-bold text-slate-400 uppercase mb-3 text-center">胃瘻(PEG)の有無</p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button onClick={() => setUsePeg(false)} className={`py-3 rounded-xl font-bold text-sm border-2 transition-all ${!usePeg ? 'bg-indigo-600 border-indigo-600 text-white' : 'bg-white border-slate-200 text-slate-500'}`}>なし</button>
+                      <button onClick={() => setUsePeg(true)} className={`py-3 rounded-xl font-bold text-sm border-2 transition-all ${usePeg ? 'bg-indigo-600 border-indigo-600 text-white' : 'bg-white border-slate-200 text-slate-500'}`}>あり</button>
+                    </div>
+                  </div>
+                </div>
+
+                <button 
+                  disabled={!patientId}
+                  onClick={() => setCurrentIdx(0)}
+                  className="w-full bg-indigo-600 text-white py-5 rounded-2xl font-black text-lg shadow-xl shadow-indigo-200 disabled:opacity-30 flex items-center justify-center gap-2"
+                >
+                  入力を始める <ChevronRight className="w-6 h-6" />
+                </button>
+              </div>
+            ) : currentIdx < QUESTIONS.length ? (
+              <div className="flex-1 flex flex-col">
+                <div className="mb-6">
+                  <span className="text-xs font-black text-indigo-600 uppercase tracking-widest">{QUESTIONS[currentIdx].domain}</span>
+                  <h2 className="text-2xl font-black text-slate-800 mt-1 leading-tight">
+                    {QUESTIONS[currentIdx].id === 5 ? (usePeg ? '5b. 胃瘻管理' : '5a. 食事摂取') : QUESTIONS[currentIdx].title}
+                  </h2>
+                </div>
+
+                <div className="flex-1 space-y-3">
+                  {(QUESTIONS[currentIdx].isDynamic ? (usePeg ? PEG_OPTIONS.yes : PEG_OPTIONS.no) : QUESTIONS[currentIdx].options).map((opt) => (
+                    <button
+                      key={opt.s}
+                      onClick={() => handleSelect(QUESTIONS[currentIdx].id, opt.s)}
+                      className={`w-full text-left p-5 rounded-2xl border-2 transition-all flex items-center gap-4 ${
+                        answers[QUESTIONS[currentIdx].id] === opt.s
+                          ? 'border-indigo-600 bg-indigo-50 shadow-md ring-1 ring-indigo-600'
+                          : 'border-slate-100 bg-slate-50/50 active:bg-slate-100'
+                      }`}
+                    >
+                      <div className={`w-10 h-10 shrink-0 rounded-full flex items-center justify-center font-black text-lg ${answers[QUESTIONS[currentIdx].id] === opt.s ? 'bg-indigo-600 text-white' : 'bg-white text-slate-300 border border-slate-200'}`}>{opt.s}</div>
+                      <div className={`text-base leading-snug ${answers[QUESTIONS[currentIdx].id] === opt.s ? 'font-bold text-indigo-900' : 'text-slate-600'}`}>{opt.l}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="flex-1 flex flex-col space-y-6">
+                <div className="text-center p-6 bg-indigo-50 rounded-3xl border-2 border-indigo-100">
+                  <div className="text-xs font-bold text-indigo-400 uppercase tracking-widest mb-2">最終確認</div>
+                  <div className="text-6xl font-black text-indigo-600 tabular-nums">{totalScore}</div>
+                  <div className="text-slate-500 font-bold mt-2">{patientId} 様</div>
+                </div>
+
+                <div className="bg-white border border-slate-100 rounded-2xl overflow-hidden shadow-sm">
+                  {DOMAINS.map(d => {
+                    const qs = QUESTIONS.filter(q => q.domain === d);
+                    const subTotal = qs.reduce((acc, q) => acc + (answers[q.id] || 0), 0);
+                    return (
+                      <div key={d} className="flex justify-between items-center p-4 border-b border-slate-50 last:border-0">
+                        <span className="text-sm font-bold text-slate-600">{d.split(' ')[0]}</span>
+                        <span className="font-black text-indigo-600">{subTotal}<span className="text-[10px] text-slate-300 ml-1">/ 12</span></span>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="flex flex-col gap-3">
+                  <button onClick={() => copyToClipboard()} className="w-full bg-slate-100 text-slate-700 py-4 rounded-2xl font-bold flex items-center justify-center gap-2">
+                    {copyStatus === 'current' ? <Check className="w-5 h-5 text-emerald-500" /> : <Copy className="w-5 h-5" />}
+                    詳細な結果をコピー
+                  </button>
+                  <button onClick={saveToCloud} className="w-full bg-emerald-500 text-white py-5 rounded-2xl font-black text-lg shadow-xl shadow-emerald-100 flex items-center justify-center gap-2">
+                    <Save className="w-6 h-6" /> クラウドに保存して終了
+                  </button>
+                  <button onClick={() => setCurrentIdx(0)} className="text-slate-400 text-sm font-bold py-2">入力を修正する</button>
+                </div>
+              </div>
+            )}
+          </main>
+
+          {currentIdx >= 0 && currentIdx < QUESTIONS.length && (
+            <footer className="bg-slate-50 border-t border-slate-100 p-4 flex justify-between items-center shrink-0">
+              <button 
+                onClick={() => setCurrentIdx(prev => prev - 1)}
+                className="flex items-center gap-1 text-slate-400 font-bold p-2"
+              >
+                <ChevronLeft className="w-5 h-5" /> 戻る
+              </button>
+              <div className="text-xs font-black text-slate-300">
+                {currentIdx + 1} / {QUESTIONS.length}
+              </div>
+              <button 
+                onClick={() => setCurrentIdx(prev => prev + 1)}
+                disabled={answers[QUESTIONS[currentIdx].id] === undefined}
+                className="flex items-center gap-1 text-indigo-600 font-bold p-2 disabled:opacity-20"
+              >
+                次へ <ChevronRight className="w-5 h-5" />
+              </button>
+            </footer>
+          )}
+        </>
+      ) : (
+        <main className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50">
+          <div className="flex justify-between items-center px-2">
+            <h2 className="font-black text-xl text-slate-800">記録履歴</h2>
+            <button 
+              onClick={exportCSV} 
+              className="text-xs font-bold bg-indigo-100 text-indigo-700 px-3 py-1.5 rounded-full flex items-center gap-1 hover:bg-indigo-200 transition-colors"
+            >
+              <Download className="w-4 h-4" /> CSV出力
+            </button>
+          </div>
+          
+          {history.length === 0 ? (
+            <div className="text-center py-20 text-slate-400">履歴はありません</div>
+          ) : (
+            history.map(record => (
+              <div key={record.id} className="bg-white p-5 rounded-3xl shadow-sm border border-slate-100 flex justify-between items-center">
+                <div>
+                  <div className="text-[10px] text-slate-400 font-mono">{record.timestamp.toLocaleDateString()}</div>
+                  <div className="font-black text-lg text-slate-800">{record.patientId}</div>
+                  <div className="flex gap-2 mt-1">
+                    {DOMAINS.map(d => {
+                       const score = QUESTIONS.filter(q => q.domain === d).reduce((acc, q) => acc + (record.answers[q.id] || 0), 0);
+                       return <div key={d} className="w-2 h-2 rounded-full" style={{ backgroundColor: score < 8 ? '#f87171' : score < 11 ? '#fbbf24' : '#34d399' }} />
+                    })}
+                  </div>
+                </div>
+                <div className="flex items-center gap-4">
+                  <div className="text-center">
+                    <div className="text-[10px] font-bold text-slate-400">SCORE</div>
+                    <div className="text-2xl font-black text-indigo-600 tabular-nums">{record.totalScore}</div>
+                  </div>
+                  <button onClick={() => copyToClipboard(record)} className={`p-3 rounded-2xl ${copyStatus === record.id ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-50 text-slate-400'}`}>
+                    {copyStatus === record.id ? <Check className="w-5 h-5" /> : <Copy className="w-5 h-5" />}
+                  </button>
+                </div>
+              </div>
+            ))
+          )}
+        </main>
+      )}
+
+      <style>{`
+        input, button { touch-action: manipulation; }
+        ::-webkit-scrollbar { display: none; }
+        body { overscroll-behavior-y: contain; }
+      `}</style>
+    </div>
+  );
+};
+
+export default App;
