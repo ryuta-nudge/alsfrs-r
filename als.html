@@ -11,6 +11,7 @@ import {
   collection, 
   doc, 
   setDoc, 
+  updateDoc, 
   onSnapshot, 
   serverTimestamp 
 } from 'firebase/firestore';
@@ -76,6 +77,8 @@ const PEG_OPTIONS = {
   no: [{s:4,l:'正常'},{s:3,l:'不器用だが介助不要'},{s:2,l:'介助が必要'},{s:1,l:'全介助'},{s:0,l:'経管栄養のみ'}],
   yes: [{s:4,l:'正常（自己管理）'},{s:3,l:'不器用だが介助不要'},{s:2,l:'準備等に介助必要'},{s:1,l:'一部手伝える'},{s:0,l:'全介助'}]
 };
+
+const SERVICES = ['訪問看護', '訪問リハビリ', '訪問診療', '外来', '入院'];
 
 const SCORE_BUCKETS = [
   { label: '0–12', min: 0, max: 12 },
@@ -217,6 +220,7 @@ const App = () => {
   const [copyStatus, setCopyStatus] = useState(null);
   const [history, setHistory] = useState([]);
   const [selectedPatientId, setSelectedPatientId] = useState('');
+  const [rowEdits, setRowEdits] = useState({});
 
   // Auth Initialization
   useEffect(() => {
@@ -255,9 +259,32 @@ const App = () => {
     return () => unsubscribe();
   }, [user]);
 
+  const totalScore = Object.values(answers).reduce((acc, curr) => acc + curr, 0);
+
+  const draftRecord = useMemo(() => {
+    const hasAnswers = Object.keys(answers).length > 0;
+    if (!hasAnswers && !patientId) return null;
+    return {
+      id: 'draft',
+      unsaved: true,
+      patientId: patientId || '（未入力）',
+      totalScore,
+      answers,
+      usePeg,
+      timestamp: new Date(),
+      service: '',
+      onsetDate: ''
+    };
+  }, [answers, patientId, totalScore, usePeg]);
+
+  const visibleRecords = useMemo(
+    () => (draftRecord ? [draftRecord, ...history] : history),
+    [draftRecord, history]
+  );
+
   const analysis = useMemo(() => {
     const byPatient = new Map();
-    history.forEach(rec => {
+    visibleRecords.forEach(rec => {
       const id = rec.patientId ?? '';
       if (!byPatient.has(id)) byPatient.set(id, []);
       byPatient.get(id).push(rec);
@@ -296,14 +323,14 @@ const App = () => {
     return {
       patients,
       patientCount: patients.length,
-      evalCount: history.length,
+      evalCount: visibleRecords.length,
       avgTotal,
       domainAvgs,
       pegYes,
       pegNo: latestRecords.length - pegYes,
       buckets
     };
-  }, [history]);
+  }, [visibleRecords]);
 
   useEffect(() => {
     if (!analysis.patients.length) {
@@ -317,7 +344,35 @@ const App = () => {
 
   const selectedPatient = analysis.patients.find(p => p.id === selectedPatientId);
 
-  const totalScore = Object.values(answers).reduce((acc, curr) => acc + curr, 0);
+  const sharedOnset = useMemo(() => {
+    const map = {};
+    visibleRecords.forEach(record => {
+      const edited = rowEdits[record.id]?.onsetDate;
+      const value = edited !== undefined ? edited : (record.onsetDate || '');
+      if (value && map[record.patientId] === undefined) map[record.patientId] = value;
+    });
+    return map;
+  }, [visibleRecords, rowEdits]);
+
+  const rowService = (record) => rowEdits[record.id]?.service ?? record.service ?? '';
+  const rowOnset = (record) => {
+    if (rowEdits[record.id]?.onsetDate !== undefined) return rowEdits[record.id].onsetDate;
+    return sharedOnset[record.patientId] || record.onsetDate || '';
+  };
+
+  const setRowField = (record, field, value) => {
+    if (field === 'onsetDate') {
+      setRowEdits(prev => {
+        const next = { ...prev };
+        visibleRecords.filter(item => item.patientId === record.patientId).forEach(item => {
+          next[item.id] = { ...next[item.id], onsetDate: value, service: next[item.id]?.service ?? rowService(item) };
+        });
+        return next;
+      });
+      return;
+    }
+    setRowEdits(prev => ({ ...prev, [record.id]: { ...prev[record.id], service: value, onsetDate: prev[record.id]?.onsetDate ?? rowOnset(record) } }));
+  };
 
   const handleSelect = (qId, score) => {
     setAnswers(prev => ({ ...prev, [qId]: score }));
@@ -368,30 +423,68 @@ const App = () => {
     document.body.removeChild(textArea);
   };
 
-  const saveToCloud = async () => {
+  const alignOnset = async (patientKey, onsetDate, skipId) => {
+    const siblings = history.filter(item => item.patientId === patientKey && item.id !== skipId);
+    await Promise.all(siblings.map(item => updateDoc(
+      doc(db, 'artifacts', appId, 'public', 'data', 'evaluations', item.id),
+      { onsetDate }
+    )));
+  };
+
+  const saveToCloud = async (meta = {}) => {
     if (!user || !patientId) return;
     try {
       const docRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'evaluations'));
-      await setDoc(docRef, { patientId, totalScore, answers, usePeg, timestamp: serverTimestamp(), createdBy: user.uid });
+      const service = meta.service || '';
+      const onsetDate = meta.onsetDate || '';
+      await setDoc(docRef, {
+        patientId, totalScore, answers, usePeg, service, onsetDate,
+        timestamp: serverTimestamp(), createdBy: user.uid
+      });
+      if (onsetDate) await alignOnset(patientId, onsetDate, docRef.id);
       setAnswers({});
       setPatientId('');
+      setRowEdits(prev => { const next = { ...prev }; delete next.draft; return next; });
       setCurrentIdx(-1);
       setView('history');
     } catch (e) { alert('保存失敗'); }
   };
 
-  const exportCSV = () => {
-    const headers = ['日時', '管理ID', '合計スコア', '胃瘻', ...QUESTIONS.map(q => q.title)];
-    const rows = history.map(h => [
+  const saveRow = async (record) => {
+    const service = rowService(record);
+    const onsetDate = rowOnset(record);
+    if (record.unsaved) {
+      await saveToCloud({ service, onsetDate });
+      return;
+    }
+    if (!user) return;
+    try {
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'evaluations', record.id), { service, onsetDate });
+      await alignOnset(record.patientId, onsetDate, record.id);
+      setRowEdits(prev => {
+        const next = { ...prev };
+        visibleRecords.filter(item => item.patientId === record.patientId).forEach(item => { delete next[item.id]; });
+        return next;
+      });
+    } catch (e) { alert('保存失敗'); }
+  };
+
+  const buildCsv = () => {
+    const headers = ['日時', '管理ID', 'サービス', '発症日', '合計スコア', '胃瘻', ...QUESTIONS.map(q => q.title)];
+    const rows = visibleRecords.map(h => [
       `"${h.timestamp.toLocaleString()}"`,
       `"${h.patientId}"`,
+      `"${rowService(h)}"`,
+      `"${rowOnset(h)}"`,
       h.totalScore,
       h.usePeg ? 'あり' : 'なし',
-      ...QUESTIONS.map(q => h.answers[q.id] ?? '-')
+      ...QUESTIONS.map(q => h.answers?.[q.id] ?? '-')
     ]);
-    
-    const content = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-    const blob = new Blob(["\uFEFF" + content], { type: 'text/csv;charset=utf-8;' });
+    return [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+  };
+
+  const exportCSV = () => {
+    const blob = new Blob(["\uFEFF" + buildCsv()], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.setAttribute("href", url);
@@ -399,6 +492,19 @@ const App = () => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const copyCsv = () => {
+    const textArea = document.createElement("textarea");
+    textArea.value = buildCsv();
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      setCopyStatus('csv');
+      setTimeout(() => setCopyStatus(null), 2000);
+    } catch (err) { console.error('Copy failed', err); }
+    document.body.removeChild(textArea);
   };
 
   return (
@@ -550,44 +656,79 @@ const App = () => {
       )}
 
       {view === 'history' && (
-        <main className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50">
-          <div className="flex justify-between items-center px-2">
-            <h2 className="font-black text-xl text-slate-800">記録履歴</h2>
-            <button 
-              onClick={exportCSV} 
-              className="text-xs font-bold bg-indigo-100 text-indigo-700 px-3 py-1.5 rounded-full flex items-center gap-1 hover:bg-indigo-200 transition-colors"
-            >
-              <Download className="w-4 h-4" /> CSV出力
-            </button>
+        <main className="flex-1 overflow-y-auto p-4 space-y-4 bg-white">
+          <div className="flex flex-wrap justify-between items-center gap-3">
+            <h2 className="font-black text-xl text-slate-800">全評価履歴</h2>
+            <div className="flex gap-2">
+              <button
+                onClick={exportCSV}
+                className="text-sm font-bold bg-green-700 text-white px-4 py-2 rounded-md flex items-center gap-1"
+              >
+                <Download className="w-4 h-4" /> CSVをダウンロード
+              </button>
+              <button
+                onClick={copyCsv}
+                className="text-sm font-bold bg-green-700 text-white px-4 py-2 rounded-md flex items-center gap-1"
+              >
+                {copyStatus === 'csv' ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />} CSVをコピー
+              </button>
+            </div>
           </div>
-          
-          {history.length === 0 ? (
-            <div className="text-center py-20 text-slate-400">履歴はありません</div>
-          ) : (
-            history.map(record => (
-              <div key={record.id} className="bg-white p-5 rounded-3xl shadow-sm border border-slate-100 flex justify-between items-center">
-                <div>
-                  <div className="text-[10px] text-slate-400 font-mono">{record.timestamp.toLocaleDateString()}</div>
-                  <div className="font-black text-lg text-slate-800">{record.patientId}</div>
-                  <div className="flex gap-2 mt-1">
-                    {DOMAINS.map(d => {
-                       const score = QUESTIONS.filter(q => q.domain === d).reduce((acc, q) => acc + (record.answers[q.id] || 0), 0);
-                       return <div key={d} className="w-2 h-2 rounded-full" style={{ backgroundColor: score < 8 ? '#f87171' : score < 11 ? '#fbbf24' : '#34d399' }} />
-                    })}
-                  </div>
-                </div>
-                <div className="flex items-center gap-4">
-                  <div className="text-center">
-                    <div className="text-[10px] font-bold text-slate-400">SCORE</div>
-                    <div className="text-2xl font-black text-indigo-600 tabular-nums">{record.totalScore}</div>
-                  </div>
-                  <button onClick={() => copyToClipboard(record)} className={`p-3 rounded-2xl ${copyStatus === record.id ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-50 text-slate-400'}`}>
-                    {copyStatus === record.id ? <Check className="w-5 h-5" /> : <Copy className="w-5 h-5" />}
-                  </button>
-                </div>
-              </div>
-            ))
-          )}
+          <p className="text-sm text-slate-500">
+            サービスは評価ごとに切り替えられます。発症日は同じ患者IDで揃えます。点数は変わりません。変更は各行の「修正」から保存できます。
+          </p>
+          <div className="overflow-x-auto border border-sky-200 rounded-lg">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-slate-500">
+                <tr>
+                  <th className="text-left font-bold p-3">評価日</th>
+                  <th className="text-left font-bold p-3">患者ID</th>
+                  <th className="text-left font-bold p-3">サービス</th>
+                  <th className="text-left font-bold p-3">発症日</th>
+                  <th className="text-right font-bold p-3">合計</th>
+                  <th className="p-3"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleRecords.length === 0 ? (
+                  <tr>
+                    <td colSpan="6" className="p-8 text-center text-slate-400">評価はまだありません</td>
+                  </tr>
+                ) : visibleRecords.map(record => (
+                  <tr key={record.id} className="border-t border-slate-100">
+                    <td className="p-3 whitespace-nowrap">
+                      {record.timestamp.toLocaleDateString()}
+                      {record.unsaved && <span className="ml-2 text-[10px] font-bold text-amber-600">未保存</span>}
+                    </td>
+                    <td className="p-3 font-bold">{record.patientId}</td>
+                    <td className="p-3">
+                      <select
+                        value={rowService(record)}
+                        onChange={(e) => setRowField(record, 'service', e.target.value)}
+                        className="border border-slate-200 rounded-md px-2 py-1 bg-white"
+                      >
+                        <option value="">未選択</option>
+                        {SERVICES.map(service => <option key={service} value={service}>{service}</option>)}
+                        {record.service && !SERVICES.includes(record.service) && <option value={record.service}>{record.service}</option>}
+                      </select>
+                    </td>
+                    <td className="p-3">
+                      <input
+                        type="date"
+                        value={rowOnset(record)}
+                        onChange={(e) => setRowField(record, 'onsetDate', e.target.value)}
+                        className="border border-slate-200 rounded-md px-2 py-1"
+                      />
+                    </td>
+                    <td className="p-3 text-right font-black text-indigo-600 tabular-nums">{record.totalScore}</td>
+                    <td className="p-3 text-right">
+                      <button onClick={() => saveRow(record)} className="text-sm font-bold text-indigo-700 px-3 py-1 rounded-md border border-indigo-200">修正</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </main>
       )}
 
@@ -598,11 +739,6 @@ const App = () => {
               <BarChart3 className="w-5 h-5 text-indigo-600" />
               <h2 className="font-black text-xl text-slate-800">全体の概況</h2>
             </div>
-            {history.length === 0 ? (
-              <div className="bg-white rounded-3xl border border-slate-100 shadow-sm p-8 text-center text-slate-400">
-                先に評価を保存してください
-              </div>
-            ) : (
               <>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4">
@@ -641,11 +777,9 @@ const App = () => {
                   <DistBarChart buckets={analysis.buckets} />
                 </div>
               </>
-            )}
           </section>
 
-          {history.length > 0 && (
-            <section className="space-y-3 pb-6">
+          <section className="space-y-3 pb-6">
               <h2 className="font-black text-xl text-slate-800 px-1">患者単位の経時変化</h2>
               <select
                 value={selectedPatientId}
@@ -761,7 +895,6 @@ const App = () => {
                 );
               })()}
             </section>
-          )}
         </main>
       )}
 
